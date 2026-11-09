@@ -1,10 +1,13 @@
 use crate::tree::{FLAG_COMMIT, TRIE_PAYLOAD_CAPACITY};
+use alloc::boxed::Box;
+use alloc::string::String as HeapString;
 use heapless::{String, Vec};
 use jinshu::node::TrieNode;
 use kpack::Opcode;
 use noun::Noun;
-use plans::layer::{Capabilities, Layer};
-use plans::sceau::Sceau;
+use plans::Plan;
+use plans::layer::{Capabilities, Layer, Layers};
+use plans::sceau::{Sceau, Verdict};
 
 const COMMIT_MAGIC: [u8; 4] = *b"JICM";
 
@@ -163,15 +166,70 @@ impl JiCommit {
         node.payload[pos..pos + msg_len].copy_from_slice(&msg_bytes[..msg_len]);
         pos += msg_len;
 
+        // Sérialisation directe des Layers (`plans::layer::Layer`) dans le TrieNode du commit
+        let layer_count = u8::try_from(self.layers.len().min(16)).unwrap_or(0);
+        node.payload[pos] = layer_count;
+        pos += 1;
+
+        for layer in self.layers.iter().take(layer_count as usize) {
+            let name_bytes = layer.name.as_bytes();
+            let name_len = name_bytes.len().min(255);
+            let desc_bytes = layer.description.as_bytes();
+            let desc_len = desc_bytes.len().min(1024);
+            let required = 4 + 1 + 32 + 1 + name_len + 2 + desc_len;
+            if pos + required > TRIE_PAYLOAD_CAPACITY {
+                break;
+            }
+
+            node.payload[pos..pos + 4].copy_from_slice(&layer.version.to_le_bytes());
+            pos += 4;
+
+            node.payload[pos] = encode_capabilities(&layer.capabilities);
+            pos += 1;
+
+            node.payload[pos..pos + 32].copy_from_slice(layer.root.as_bytes());
+            pos += 32;
+
+            node.payload[pos] = u8::try_from(name_len).unwrap_or(0);
+            pos += 1;
+            node.payload[pos..pos + name_len].copy_from_slice(&name_bytes[..name_len]);
+            pos += name_len;
+
+            node.payload[pos..pos + 2]
+                .copy_from_slice(&u16::try_from(desc_len).unwrap_or(0).to_le_bytes());
+            pos += 2;
+            node.payload[pos..pos + desc_len].copy_from_slice(&desc_bytes[..desc_len]);
+            pos += desc_len;
+        }
+
         node.param = u32::try_from(pos).unwrap_or(0);
         node
     }
 
-    /// Reconstruit un `JiCommit` depuis son [`TrieNode`] stocké dans `jinshu`.
-    pub fn from_trie_node(
-        node: &TrieNode,
-        layers: Vec<Layer, 16>,
-    ) -> Result<Self, &'static str> {
+    /// Reconstruit le [`Plan`] du commit à partir de ses [`Layer`]s et vérifie son [`Sceau`] via [`Sceau::weigh`].
+    pub fn verify_sceau(&self) -> Result<Verdict, &'static str> {
+        let mut phoenix = Layers::new(self.root_tree.clone());
+        if let Some(first) = self.layers.first() {
+            phoenix.add_layer(first.clone())?;
+        } else {
+            phoenix.add_layer(Layer::new(
+                "amentys-core",
+                1,
+                "Amentys OS Kernel & VFS Base Layer",
+                self.root_tree.clone(),
+                Capabilities::None,
+            ))?;
+        }
+
+        let mut plan = Plan::new(self.root_tree.clone(), &mut phoenix, self.branch)?;
+        for layer in &self.layers {
+            plan.add_layer(layer.clone())?;
+        }
+        Ok(self.sceau.weigh(&plan))
+    }
+
+    /// Reconstruit un `JiCommit` (incluant ses [`Layer`]s sérialisées) depuis son [`TrieNode`] stocké dans `jinshu`.
+    pub fn from_trie_node(node: &TrieNode) -> Result<Self, &'static str> {
         if node.flags != FLAG_COMMIT {
             return Err("TrieNode invalide : ce n'est pas un JiCommit (FLAG_COMMIT)");
         }
@@ -260,6 +318,69 @@ impl JiCommit {
             .map_err(|_| "Message de commit non UTF-8")?;
         let mut message = String::<128>::new();
         let _ = core::fmt::Write::write_str(&mut message, msg_str);
+        pos += msg_len;
+
+        if pos >= node.payload.len() {
+            return Err("Payload de commit tronque avant layer_count");
+        }
+        let layer_count = node.payload[pos];
+        pos += 1;
+        if layer_count > 16 {
+            return Err("Nombre de Layers invalide dans le TrieNode de commit (max 16)");
+        }
+        if layer_count != sceau_layers {
+            return Err("Incoherence entre layer_count du commit et Sceau.layers");
+        }
+
+        let mut layers: Vec<Layer, 16> = Vec::new();
+        for _ in 0..layer_count {
+            if pos + 4 + 1 + 32 + 1 > node.payload.len() {
+                return Err("Layer tronquee dans le TrieNode de commit");
+            }
+            let version = u32::from_le_bytes(
+                node.payload[pos..pos + 4]
+                    .try_into()
+                    .map_err(|_| "Lecture layer.version")?,
+            );
+            pos += 4;
+
+            let capabilities = decode_capabilities(node.payload[pos])?;
+            pos += 1;
+
+            let root =
+                Noun::from_bytes(&node.payload[pos..pos + 32]).ok_or("Layer root Noun invalide")?;
+            pos += 32;
+
+            let name_len = node.payload[pos] as usize;
+            pos += 1;
+            if pos + name_len + 2 > node.payload.len() {
+                return Err("Nom de Layer tronque dans le TrieNode de commit");
+            }
+            let name_str = core::str::from_utf8(&node.payload[pos..pos + name_len])
+                .map_err(|_| "Nom de Layer non UTF-8")?;
+            pos += name_len;
+
+            let desc_len =
+                u16::from_le_bytes([node.payload[pos], node.payload[pos + 1]]) as usize;
+            pos += 2;
+            if pos + desc_len > node.payload.len() {
+                return Err("Description de Layer tronquee dans le TrieNode de commit");
+            }
+            let desc_str = core::str::from_utf8(&node.payload[pos..pos + desc_len])
+                .map_err(|_| "Description de Layer non UTF-8")?;
+            pos += desc_len;
+
+            let layer = Layer::new(
+                intern_layer_str(name_str),
+                version,
+                intern_layer_str(desc_str),
+                root,
+                capabilities,
+            );
+            layers
+                .push(layer)
+                .map_err(|_| "Trop de Layers dans le TrieNode de commit")?;
+        }
 
         let commit = Self {
             seq,
@@ -288,8 +409,20 @@ impl JiCommit {
         if !commit.verify_checkpoint() {
             return Err("Signature cryptographique du Checkpoint invalide");
         }
+        if let Verdict::Refuse(reason) = commit.verify_sceau()? {
+            return Err(reason);
+        }
 
         Ok(commit)
+    }
+}
+
+fn intern_layer_str(s: &str) -> &'static str {
+    match s {
+        "" => "",
+        "amentys-core" => "amentys-core",
+        "Amentys OS Kernel & VFS Base Layer" => "Amentys OS Kernel & VFS Base Layer",
+        other => Box::leak(HeapString::from(other).into_boxed_str()),
     }
 }
 

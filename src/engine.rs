@@ -1,5 +1,5 @@
 use crate::commit::{Checkpoint, JiCommit};
-use crate::superblock::{AWQ_BRANCH_COUNT, JiSuperblock};
+use crate::superblock::{AWQ_BRANCH_COUNT, FIRST_DATA_LBA, JiSuperblock};
 use crate::tree::{
     DirRecord, FLAG_BLOB, FLAG_DIR, TRIE_PAYLOAD_CAPACITY, VAL_TYPE_INODE, compute_node_noun,
     lookup_dir_entry, make_blob_node, make_delta_blob_node, make_empty_dir_node, read_dir_entries,
@@ -43,7 +43,6 @@ pub struct JiEngine<'a, D: BlockDevice> {
     pub working_root: Noun,
     pub phoenix: Layers,
     pub active_plan: Plan,
-    commit_layers: BTreeMap<Noun, Vec<Layer, 16>>,
     branch_roots: [Noun; AWQ_BRANCH_COUNT],
 }
 
@@ -89,12 +88,104 @@ impl<'a, D: BlockDevice> JiEngine<'a, D> {
             working_root: root_noun,
             phoenix,
             active_plan,
-            commit_layers: BTreeMap::new(),
             branch_roots,
         };
 
         // 3. Premier commit fondateur (Genesis) + persistance du Superbloc au LBA 0
         engine.commit("genesis: initial OS state", 1, 1000)?;
+        Ok(engine)
+    }
+
+    /// Rouvre à froid un disque VCS `ji` déjà initialisé (au redémarrage de l'OS) :
+    ///
+    /// 1. Relit et vérifie le [`JiSuperblock`] au LBA `0` (magic, version, bornes et checksum BLAKE3).
+    /// 2. Scanne les blocs de `FIRST_DATA_LBA` (`8`) jusqu'à `superblock.head_lba` pour reconstruire
+    ///    automatiquement le [`NounIndex`] (`disk_index`) et l'état du `DiskAllocator` `jinshu`.
+    /// 3. Monte automatiquement le commit `branch_heads[active_branch]` (préchargement Merkle dans
+    ///    `core_ocean`, désérialisation des [`Layer`]s depuis le disque et vérification [`Sceau::weigh`]).
+    pub fn open(device: &'a D, total_lbas: u64) -> Result<Self, &'static str> {
+        let superblock = JiSuperblock::read_from_device(device)?;
+        if superblock.head_lba > total_lbas {
+            return Err("Superbloc invalide : head_lba depasse la capacite du disque");
+        }
+
+        let active_branch = superblock.active_branch;
+        let active_commit_noun = superblock.branch_heads[active_branch as usize].clone();
+        if active_commit_noun.is_null() {
+            return Err("Superbloc invalide : aucun commit sur la branche AWQ active");
+        }
+
+        // 1. Reconstruction du DiskAllocator et du NounIndex par scan séquentiel des LBAs alloués
+        let mut storage = StorageEngine::new(total_lbas, device);
+        let mut disk_index = NounIndex::new();
+        let mut scratch_node = TrieNode::new();
+        let scratch_addr = core::ptr::from_mut(&mut scratch_node) as u64;
+
+        let mut lba = FIRST_DATA_LBA;
+        while lba < superblock.head_lba {
+            let allocated_lba = storage
+                .allocator
+                .allocate_node()
+                .ok_or("Capacite disque insuffisante lors de la reconstruction du DiskAllocator")?;
+            if allocated_lba != lba {
+                return Err("Desynchronisation LBA lors de la reconstruction du DiskAllocator");
+            }
+            storage.fetch_node(lba, scratch_addr)?;
+            let noun = compute_node_noun(&scratch_node);
+            disk_index.insert(noun, lba)?;
+            lba += 8;
+        }
+
+        // 2. Lecture et validation du commit actif (Checkpoint + Sceau + Layers désérialisées)
+        let active_commit_lba = disk_index
+            .get_lba(&active_commit_noun)
+            .ok_or("Commit actif introuvable dans le NounIndex reconstruit")?;
+        storage.fetch_node(active_commit_lba, scratch_addr)?;
+        let active_commit = JiCommit::from_trie_node(&scratch_node)?;
+
+        let mut core_ocean = BTreeMap::new();
+        core_ocean.insert(active_commit_noun.clone(), scratch_node.clone());
+
+        let base_layer = active_commit
+            .layers
+            .first()
+            .cloned()
+            .unwrap_or_else(Self::default_kernel_layer);
+        let mut phoenix = Layers::new(active_commit.root_tree.clone());
+        phoenix.add_layer(base_layer)?;
+
+        let active_plan = Plan::new(
+            active_commit.root_tree.clone(),
+            &mut phoenix,
+            active_branch,
+        )?;
+
+        let mut branch_roots = core::array::from_fn(|_| active_commit.root_tree.clone());
+        for (b, head_noun) in superblock.branch_heads.iter().enumerate() {
+            if !head_noun.is_null()
+                && let Some(b_lba) = disk_index.get_lba(head_noun)
+            {
+                storage.fetch_node(b_lba, scratch_addr)?;
+                if let Ok(b_commit) = JiCommit::from_trie_node(&scratch_node) {
+                    branch_roots[b] = b_commit.root_tree;
+                }
+            }
+        }
+
+        let mut engine = Self {
+            superblock,
+            storage,
+            disk_index,
+            core_ocean,
+            virtual_ocean: BTreeMap::new(),
+            working_root: active_commit.root_tree,
+            phoenix,
+            active_plan,
+            branch_roots,
+        };
+
+        // 3. Montage complet du commit actif (CoreOceanBuilder::deep_load + pesée Sceau::weigh)
+        engine.mount(&active_commit_noun, Some(active_branch))?;
         Ok(engine)
     }
 
@@ -345,7 +436,7 @@ impl<'a, D: BlockDevice> JiEngine<'a, D> {
             root_tree: self.working_root.clone(),
             checkpoint,
             sceau,
-            layers: layers_snapshot.clone(),
+            layers: layers_snapshot,
             message: msg_stack,
         };
 
@@ -353,8 +444,6 @@ impl<'a, D: BlockDevice> JiEngine<'a, D> {
         let commit_node = ji_commit.to_trie_node();
         let commit_noun = compute_node_noun(&commit_node);
         let commit_lba = self.persist_node_if_needed(&commit_noun, &commit_node)?;
-        self.commit_layers
-            .insert(commit_noun.clone(), layers_snapshot);
 
         // 6. Mise à jour et persistance du Superbloc au LBA 0
         self.superblock.commit_seq = seq;
@@ -367,15 +456,10 @@ impl<'a, D: BlockDevice> JiEngine<'a, D> {
         Ok(commit_noun)
     }
 
-    /// Charge et vérifie un [`JiCommit`] depuis le store par son [`Noun`].
+    /// Charge et vérifie un [`JiCommit`] (avec ses [`Layer`]s désérialisées) depuis le store par son [`Noun`].
     pub fn load_commit(&self, commit_noun: &Noun) -> Result<JiCommit, &'static str> {
         let node = self.fetch_node_ref(commit_noun)?;
-        let layers = self
-            .commit_layers
-            .get(commit_noun)
-            .cloned()
-            .unwrap_or_default();
-        JiCommit::from_trie_node(&node, layers)
+        JiCommit::from_trie_node(&node)
     }
 
     /// Monte un commit (`ji mount <commit_noun> [target_branch]`) et restaure l'état exact de l'OS :

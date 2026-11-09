@@ -344,4 +344,121 @@ mod tests {
         assert!(out.as_str().contains("branch=awq/2"));
         assert!(out.as_str().contains("init.lys"));
     }
+
+    #[test]
+    fn test_cold_reboot_open_and_layer_persistence_on_disk() {
+        let device = MemBlockDevice::new(64);
+        let commit_v1: Noun;
+        let commit_v2: Noun;
+        let head_lba_before_reboot: u64;
+
+        // Phase 1 : Session initiale avant extinction de l'OS
+        {
+            let mut engine = JiEngine::init(
+                &device,
+                device.total_lbas(),
+                JiEngine::<MemBlockDevice>::default_kernel_layer(),
+            )
+            .expect("init");
+
+            engine
+                .stage_file("kernel.sys", b"AMENTYS-KERNEL-V1.0")
+                .unwrap();
+            engine.stage_file("initrd.img", &[0x5A; 256]).unwrap();
+            engine
+                .add_os_layer(Layer::new(
+                    "vfs-cubefs",
+                    1,
+                    "CubeFS Immutable Recipe Filesystem",
+                    Noun::of(b"vfs-cubefs-v1"),
+                    Capabilities::ReadWrite,
+                ))
+                .unwrap();
+            commit_v1 = engine.commit("release v1.0", 100, 600).unwrap();
+
+            engine
+                .stage_file_delta("kernel.sys", b"AMENTYS-KERNEL-V2.0-COLD-BOOT")
+                .unwrap();
+            engine
+                .add_os_layer(Layer::new(
+                    "wuu-console",
+                    2,
+                    "Wuu Zero-Heap Console & TUI",
+                    Noun::of(b"wuu-console-v2"),
+                    Capabilities::All,
+                ))
+                .unwrap();
+            commit_v2 = engine.commit("release v2.0", 200, 1200).unwrap();
+            head_lba_before_reboot = engine.superblock.head_lba;
+        }
+        // Ici `engine` est intégralement détruit : plus aucun état en RAM (`core_ocean`, `disk_index`, `commit_layers`) !
+
+        // Phase 2 : Redémarrage à froid (`JiEngine::open`) uniquement à partir du BlockDevice
+        let mut reopened =
+            JiEngine::open(&device, device.total_lbas()).expect("JiEngine::open au reboot");
+
+        assert_eq!(reopened.superblock.commit_seq, 3);
+        assert_eq!(reopened.superblock.head_lba, head_lba_before_reboot);
+        assert_eq!(reopened.superblock.branch_heads[0], commit_v2);
+
+        // Vérifie que les 3 Layers ont été intégralement désérialisées depuis le TrieNode sur disque
+        let restored_layers = reopened.active_plan.get_layers();
+        assert_eq!(restored_layers.len(), 3);
+        assert_eq!(restored_layers[0].name, "amentys-core");
+        assert_eq!(restored_layers[1].name, "vfs-cubefs");
+        assert_eq!(
+            restored_layers[1].description,
+            "CubeFS Immutable Recipe Filesystem"
+        );
+        assert_eq!(restored_layers[1].capabilities, Capabilities::ReadWrite);
+        assert_eq!(restored_layers[2].name, "wuu-console");
+        assert_eq!(restored_layers[2].version, 2);
+        assert_eq!(restored_layers[2].capabilities, Capabilities::All);
+
+        // Vérifie que les fichiers (y compris Delta Kpack et RLE) sont lisibles après reboot
+        let mut buf = [0u8; 256];
+        let n_k = reopened.read_working_file("kernel.sys", &mut buf).unwrap();
+        assert_eq!(&buf[..n_k], b"AMENTYS-KERNEL-V2.0-COLD-BOOT");
+
+        let n_i = reopened.read_working_file("initrd.img", &mut buf).unwrap();
+        assert_eq!(n_i, 256);
+        assert_eq!(&buf[..n_i], &[0x5A; 256]);
+
+        // Phase 3 : Time-Travel (`ji mount`) vers `commit_v1` après un reboot à froid
+        let mounted_v1 = reopened
+            .mount(&commit_v1, None)
+            .expect("mount v1 apres reboot");
+        assert_eq!(mounted_v1.verdict, Verdict::Accept);
+        assert_eq!(reopened.active_plan.get_layers().len(), 2);
+        assert_eq!(reopened.active_plan.get_layers()[1].name, "vfs-cubefs");
+
+        let n_k1 = reopened.read_working_file("kernel.sys", &mut buf).unwrap();
+        assert_eq!(&buf[..n_k1], b"AMENTYS-KERNEL-V1.0");
+
+        // Phase 4 : Nouveau commit après reboot -> allocation LBA continue sans écrasement
+        reopened.stage_file("post_reboot.cfg", b"ok=true").unwrap();
+        let commit_v3 = reopened
+            .commit("post-reboot commit", 300, 800)
+            .expect("commit post-reboot");
+        assert!(!commit_v3.is_null());
+        assert!(reopened.superblock.head_lba > head_lba_before_reboot);
+
+        // Phase 5 : Détection par Sceau::weigh d'une altération d'une Layer sur le disque
+        let v3_lba = reopened.disk_index.get_lba(&commit_v3).unwrap();
+        let mut raw_commit_block = device.read_block(v3_lba).unwrap();
+        // On altère le dernier octet sérialisé du commit (dans la description de la dernière Layer)
+        let param_len = u32::from_le_bytes([
+            raw_commit_block[4],
+            raw_commit_block[5],
+            raw_commit_block[6],
+            raw_commit_block[7],
+        ]) as usize;
+        let payload_offset = 8 + 512; // en-tête TrieNode (8) + 16 branches Noun (512)
+        raw_commit_block[payload_offset + param_len - 1] ^= 0x01;
+        device.write_block(v3_lba, &raw_commit_block).unwrap();
+
+        reopened.core_ocean.remove(&commit_v3);
+        let err = reopened.load_commit(&commit_v3).unwrap_err();
+        assert_eq!(err, "noun mismatch");
+    }
 }
