@@ -1,4 +1,4 @@
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(target_os = "none", no_std)]
 
 extern crate alloc;
 
@@ -13,17 +13,20 @@ pub mod tree;
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::execute_cli;
-    use crate::device::MemBlockDevice;
+    use crate::cli::{execute_cli, interactive_commit_prompt, interactive_mount_prompt};
+    use crate::device::{FileBlockDevice, MemBlockDevice};
     use crate::engine::{JiEngine, format_noun_short};
     use crate::superblock::{FIRST_DATA_LBA, JiSuperblock};
-    use crate::tree::{blob_inode_and_extent, to_cubefs_btree_node};
+    use crate::tree::{
+        FLAG_INODE, blob_inode_and_extent, read_inode_extents, to_cubefs_btree_node,
+    };
+    use alloc::vec::Vec;
     use cubefs::KpackReader;
     use kpack::Opcode;
     use noun::Noun;
     use plans::layer::{Capabilities, Layer};
     use plans::sceau::Verdict;
-    use wuu::{ColorMode, StackString};
+    use wuu::{ColorMode, PromptKey, StackString};
 
     #[test]
     fn test_superblock_roundtrip_and_corruption_detection() {
@@ -460,5 +463,343 @@ mod tests {
         reopened.core_ocean.remove(&commit_v3);
         let err = reopened.load_commit(&commit_v3).unwrap_err();
         assert_eq!(err, "noun mismatch");
+    }
+
+    #[test]
+    fn test_priority2_multi_chunk_files_and_subdirectories() {
+        let device = MemBlockDevice::new(128);
+        let mut engine = JiEngine::init(
+            &device,
+            device.total_lbas(),
+            JiEngine::<MemBlockDevice>::default_kernel_layer(),
+        )
+        .expect("init");
+
+        // 1. Création d'un fichier multi-chunks de 12 000 octets (> 3576 octets -> 4 chunks FLAG_BLOB + 1 FLAG_INODE)
+        let mut large_kernel: Vec<u8> = Vec::with_capacity(12_000);
+        for i in 0..12_000usize {
+            large_kernel.push(((i * 31 + 7) & 0xFF) as u8);
+        }
+
+        let inode_noun = engine
+            .stage_file("/boot/kernel_x64.elf", &large_kernel)
+            .expect("stage multi-chunk file in /boot");
+        let inode_node = engine.fetch_node_ref(&inode_noun).unwrap();
+        assert_eq!(inode_node.flags, FLAG_INODE);
+
+        let (inode_meta, extents) = read_inode_extents(&inode_node).unwrap();
+        assert_eq!(inode_meta.size, 12_000);
+        assert_eq!(extents.len(), 4);
+
+        // 2. Création de sous-répertoires profonds (/sys/drivers/nvme.drv, /etc/init.lys)
+        engine
+            .stage_file("/sys/drivers/nvme.drv", b"NVME-QUEUE-DRIVER-V1")
+            .unwrap();
+        engine
+            .stage_file("/etc/init.lys", b"service = nvme")
+            .unwrap();
+        let c1 = engine
+            .commit("feat(vfs): multi-chunk kernel and deep subdirs", 110, 900)
+            .unwrap();
+
+        // 3. Branche AWQ 1 : ajout d'un second driver dans le MÊME sous-répertoire `/sys/drivers/`
+        engine.switch_branch(1).unwrap();
+        engine
+            .stage_file("/sys/drivers/virtio.drv", b"VIRTIO-BLK-DRIVER-V1")
+            .unwrap();
+        engine
+            .commit("feat(awq/1): add virtio driver in /sys/drivers", 120, 900)
+            .unwrap();
+
+        // 4. Retour sur AWQ 0 : ajout d'un troisième driver dans `/sys/drivers/` et fusion récursive AWQ 1 -> AWQ 0
+        engine.switch_branch(0).unwrap();
+        engine
+            .stage_file("/sys/drivers/ahci.drv", b"AHCI-SATA-DRIVER-V1")
+            .unwrap();
+        engine
+            .commit("feat(awq/0): add ahci driver in /sys/drivers", 130, 900)
+            .unwrap();
+
+        engine
+            .merge_branches(1, 0, "merge deep /sys/drivers trees", 140, 1000)
+            .expect("merge_branches recursif sur /sys/drivers");
+
+        // Vérifie que les 3 drivers dans `/sys/drivers/` coexistent après le merge récursif
+        let drivers = engine.list_working_dir("/sys/drivers").unwrap();
+        assert_eq!(drivers.len(), 3);
+
+        let mut small_buf = [0u8; 64];
+        let n_nvme = engine
+            .read_working_file("/sys/drivers/nvme.drv", &mut small_buf)
+            .unwrap();
+        assert_eq!(&small_buf[..n_nvme], b"NVME-QUEUE-DRIVER-V1");
+        let n_virt = engine
+            .read_working_file("/sys/drivers/virtio.drv", &mut small_buf)
+            .unwrap();
+        assert_eq!(&small_buf[..n_virt], b"VIRTIO-BLK-DRIVER-V1");
+        let n_ahci = engine
+            .read_working_file("/sys/drivers/ahci.drv", &mut small_buf)
+            .unwrap();
+        assert_eq!(&small_buf[..n_ahci], b"AHCI-SATA-DRIVER-V1");
+
+        // 5. Vérifie le rechargement complet du fichier multi-chunks de 12 Ko après vidage de CoreOcean (`mount`)
+        let c1_node = engine.fetch_node_ref(&c1).unwrap();
+        engine.core_ocean.clear();
+        engine.core_ocean.insert(c1.clone(), c1_node);
+        engine.mount(&c1, None).expect("mount c1 avec 12Ko");
+
+        let mut read_back = alloc::vec![0u8; 12_000];
+        let read_len = engine
+            .read_working_file("/boot/kernel_x64.elf", &mut read_back)
+            .expect("lecture multi-chunks 12Ko");
+        assert_eq!(read_len, 12_000);
+        assert_eq!(read_back, large_kernel);
+    }
+
+    #[test]
+    fn test_priority3_wuu_dashboard_interactive_prompts_and_file_block_device() {
+        let tmp_path = "/tmp/junie_ji_test_disk.img";
+        let _ = std::fs::remove_file(tmp_path);
+
+        let c1_noun: Noun;
+        let c2_noun: Noun;
+
+        {
+            let file_dev = FileBlockDevice::open_or_create(tmp_path, 96).expect("create disk img");
+            let mut engine = JiEngine::init(
+                &file_dev,
+                file_dev.total_lbas(),
+                JiEngine::<FileBlockDevice>::default_kernel_layer(),
+            )
+            .expect("init on FileBlockDevice");
+
+            let mut out = StackString::<2048>::new();
+            execute_cli(
+                &mut engine,
+                &["mkdir", "/boot/config"],
+                ColorMode::Plain,
+                &mut out,
+            )
+            .unwrap();
+            assert!(out.as_str().contains("[ dir ]"));
+
+            out = StackString::<2048>::new();
+            execute_cli(
+                &mut engine,
+                &["stage", "/boot/config/grub.cfg", "timeout=0"],
+                ColorMode::Plain,
+                &mut out,
+            )
+            .unwrap();
+
+            // Test du prompt interactif `wuu::Prompt::text` pour créer un commit
+            let mut prompt_out = StackString::<2048>::new();
+            let keys_commit = [
+                PromptKey::Character('v'),
+                PromptKey::Character('1'),
+                PromptKey::Character('-'),
+                PromptKey::Character('t'),
+                PromptKey::Character('u'),
+                PromptKey::Character('i'),
+                PromptKey::Enter,
+            ];
+            c1_noun = interactive_commit_prompt(&mut engine, &keys_commit, 50, 800, &mut prompt_out)
+                .unwrap()
+                .expect("commit interactif accepte");
+
+            // Deuxième commit via CLI
+            execute_cli(
+                &mut engine,
+                &["stage", "/boot/config/grub.cfg", "timeout=5"],
+                ColorMode::Plain,
+                &mut out,
+            )
+            .unwrap();
+            execute_cli(
+                &mut engine,
+                &["commit", "-m", "v2-tui"],
+                ColorMode::Plain,
+                &mut out,
+            )
+            .unwrap();
+            c2_noun = engine.superblock.branch_heads[0].clone();
+            assert_ne!(c1_noun, c2_noun);
+
+            // Test de `ji ls /boot/config` et `ji cat /boot/config/grub.cfg`
+            out = StackString::<2048>::new();
+            execute_cli(
+                &mut engine,
+                &["ls", "/boot/config"],
+                ColorMode::Plain,
+                &mut out,
+            )
+            .unwrap();
+            assert!(out.as_str().contains("grub.cfg"));
+            assert!(out.as_str().contains("FILE"));
+
+            out = StackString::<2048>::new();
+            execute_cli(
+                &mut engine,
+                &["cat", "/boot/config/grub.cfg"],
+                ColorMode::Plain,
+                &mut out,
+            )
+            .unwrap();
+            assert!(out.as_str().contains("timeout=5"));
+
+            // Test de `ji dashboard` (ProgressBar + Panels Wuu)
+            out = StackString::<2048>::new();
+            execute_cli(&mut engine, &["dashboard"], ColorMode::Plain, &mut out).unwrap();
+            assert!(out.as_str().contains("JI VCS DASHBOARD"));
+            assert!(out.as_str().contains("NVMe LBA Store"));
+            assert!(out.as_str().contains("[AWQ Branches]"));
+            assert!(out.as_str().contains("[Jinshu Oceans]"));
+        }
+
+        // Réouverture du fichier image disque sous Linux via `FileBlockDevice` + `JiEngine::open`
+        {
+            let file_dev = FileBlockDevice::open_or_create(tmp_path, 96).expect("reopen disk img");
+            let mut engine =
+                JiEngine::open(&file_dev, file_dev.total_lbas()).expect("open from disk img");
+            assert_eq!(engine.superblock.branch_heads[0], c2_noun);
+
+            // Test du sélecteur interactif `wuu::Prompt::noun_select` :
+            // L'historique contient `[c2_noun, c1_noun, genesis]` ; `Down` + `Enter` sélectionne `c1_noun` (index 1) !
+            let mut prompt_out = StackString::<2048>::new();
+            let mounted = interactive_mount_prompt(
+                &mut engine,
+                0,
+                Some(3),
+                &[PromptKey::Down, PromptKey::Enter],
+                &mut prompt_out,
+            )
+            .unwrap()
+            .expect("mount interactif accepte");
+
+            assert_eq!(mounted.commit_noun, c1_noun);
+            assert_eq!(mounted.branch, 3);
+
+            let mut buf = [0u8; 32];
+            let n = engine
+                .read_working_file("/boot/config/grub.cfg", &mut buf)
+                .unwrap();
+            assert_eq!(&buf[..n], b"timeout=0");
+        }
+
+        let _ = std::fs::remove_file(tmp_path);
+    }
+
+    #[test]
+    fn test_priority4_advanced_kpack_opcodes_and_cubefs_nucleator() {
+        let device = MemBlockDevice::new(64);
+        let mut engine = JiEngine::init(
+            &device,
+            device.total_lbas(),
+            JiEngine::<MemBlockDevice>::default_kernel_layer(),
+        )
+        .expect("init");
+
+        // 1. Opcode::Dict : création d'un dictionnaire de mots de 4 octets et compression d'un fichier par indices
+        engine
+            .stage_file("/sys/dict.bin", b"BOOTKERNINITUSER")
+            .unwrap();
+        let dict_blob_noun = engine
+            .stage_file_dict(
+                "/sys/sequence.bin",
+                "/sys/dict.bin",
+                4,
+                b"USERBOOTINITKERNBOOT",
+            )
+            .expect("stage_file_dict");
+        let dict_node = engine.fetch_node_ref(&dict_blob_noun).unwrap();
+        assert_eq!(dict_node.opcode, Opcode::Dict as u8);
+
+        let mut buf = [0u8; 64];
+        let n_dict = engine
+            .read_working_file("/sys/sequence.bin", &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n_dict], b"USERBOOTINITKERNBOOT");
+
+        // 2. Opcode::Xor (clé constante ET différentiel par rapport à la version parente)
+        let xor_key_noun = engine
+            .stage_file_xor_key("/sec/token.bin", 0x5A, b"AMENTYS-SECRET-KEY")
+            .unwrap();
+        assert_eq!(
+            engine.fetch_node_ref(&xor_key_noun).unwrap().opcode,
+            Opcode::Xor as u8
+        );
+        let n_xk = engine
+            .read_working_file("/sec/token.bin", &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n_xk], b"AMENTYS-SECRET-KEY");
+
+        let xor_diff_noun = engine
+            .stage_file_xor_delta("/sec/token.bin", b"AMENTYS-ROTATED-99")
+            .unwrap();
+        let xor_diff_node = engine.fetch_node_ref(&xor_diff_noun).unwrap();
+        assert_eq!(xor_diff_node.opcode, Opcode::Xor as u8);
+        assert!(xor_diff_node.has_branch(0));
+        let n_xd = engine
+            .read_working_file("/sec/token.bin", &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n_xd], b"AMENTYS-ROTATED-99");
+
+        // 3. Opcode::Seed (`xorshift32` + patchs épars automatiques)
+        let seed_noun = engine
+            .stage_file_seed("/boot/synth.bin", 42, b"SYNTHETIC-AMENTYS-PAYLOAD")
+            .unwrap();
+        assert_eq!(
+            engine.fetch_node_ref(&seed_noun).unwrap().opcode,
+            Opcode::Seed as u8
+        );
+        let n_seed = engine
+            .read_working_file("/boot/synth.bin", &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n_seed], b"SYNTHETIC-AMENTYS-PAYLOAD");
+
+        // 4. Opcode::Rs (décalage bit-à-bit)
+        let rs_data = [0x01u8, 0x02, 0x10, 0x20, 0x3F];
+        let rs_noun = engine.stage_file_rs("/boot/shifted.bin", 2, &rs_data).unwrap();
+        assert_eq!(
+            engine.fetch_node_ref(&rs_noun).unwrap().opcode,
+            Opcode::Rs as u8
+        );
+        let n_rs = engine
+            .read_working_file("/boot/shifted.bin", &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n_rs], &rs_data);
+
+        // 5. `cubefs::Nucleator::insert_byte` en Copy-on-Write sur un fichier de travail
+        engine.stage_file("/boot/ tag.txt", b"AMNTYS").unwrap();
+        let (_new_noun, ejected) = engine
+            .nucleate_working_file_byte("/boot/ tag.txt", 2, b'E')
+            .expect("nucleate_working_file_byte");
+        assert_eq!(ejected, 0);
+        let n_nuc = engine
+            .read_working_file("/boot/ tag.txt", &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n_nuc], b"AMENTYS");
+
+        // Validation par commit + mount Time-Travel de toutes ces recettes kpack avancées
+        let commit_adv = engine
+            .commit("feat(kpack): dict, xor, seed, rs and nucleator", 500, 1000)
+            .unwrap();
+        let adv_node = engine.fetch_node_ref(&commit_adv).unwrap();
+        engine.core_ocean.clear();
+        engine.core_ocean.insert(commit_adv.clone(), adv_node);
+        engine.mount(&commit_adv, None).unwrap();
+
+        let n_dict2 = engine
+            .read_working_file("/sys/sequence.bin", &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n_dict2], b"USERBOOTINITKERNBOOT");
+        let n_xd2 = engine
+            .read_working_file("/sec/token.bin", &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n_xd2], b"AMENTYS-ROTATED-99");
+        let n_seed2 = engine
+            .read_working_file("/boot/synth.bin", &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n_seed2], b"SYNTHETIC-AMENTYS-PAYLOAD");
     }
 }

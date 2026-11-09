@@ -1,4 +1,4 @@
-use cubefs::{BTreeEntry, BTreeIterator, BTreeNode, Extent, Inode};
+use cubefs::{BTreeEntry, BTreeIterator, BTreeNode, Extent, Inode, Nucleator};
 use heapless::{String, Vec};
 use jinshu::node::TrieNode;
 use kpack::Opcode;
@@ -6,6 +6,15 @@ use noun::Noun;
 
 /// Taille maximale du payload d'un `TrieNode` (`jinshu::node::TrieNode`).
 pub const TRIE_PAYLOAD_CAPACITY: usize = 3576;
+
+/// Capacité utile d'un `TrieNode` lorsque les 2 derniers octets stockent la taille logique (`Dict`, `Xor`, `Seed`, `Rs`).
+pub const TRIE_RECIPE_DATA_CAPACITY: usize = TRIE_PAYLOAD_CAPACITY - 2;
+
+/// Nombre maximal de chunks directs par nœud `FLAG_INODE` (16 branches AWQ).
+pub const MAX_INODE_CHUNKS: usize = 16;
+
+/// Taille maximale d'un fichier multi-chunks sur un seul niveau d'`Inode` (`16 * 3576 = 57 216` octets).
+pub const MAX_MULTI_CHUNK_FILE_SIZE: usize = MAX_INODE_CHUNKS * TRIE_PAYLOAD_CAPACITY;
 
 /// Indicateur `TrieNode.flags` pour un nœud de données contenant une recette `kpack`.
 pub const FLAG_BLOB: u8 = 0x01;
@@ -16,6 +25,9 @@ pub const FLAG_DIR: u8 = 0x02;
 /// Indicateur `TrieNode.flags` pour un nœud de commit `JiCommit`.
 pub const FLAG_COMMIT: u8 = 0x03;
 
+/// Indicateur `TrieNode.flags` pour un nœud `cubefs::Inode` multi-chunks contenant des `cubefs::Extent`s.
+pub const FLAG_INODE: u8 = 0x04;
+
 /// Type d'entrée `cubefs` : Inode / Fichier recette `kpack`.
 pub const VAL_TYPE_INODE: u8 = 0;
 
@@ -24,6 +36,8 @@ pub const VAL_TYPE_DIRECTORY: u8 = 1;
 
 /// Type d'entrée `cubefs` : Donnée inline.
 pub const VAL_TYPE_INLINE: u8 = 2;
+
+const INODE_MAGIC: [u8; 4] = *b"JINO";
 
 /// Entrée nommée d'un répertoire `cubefs` rattachée à l'une des 16 branches d'un `TrieNode`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +66,61 @@ pub fn name_hash_and_slot(name: &str) -> (u64, u8) {
     ]);
     let slot = bytes[0] & 0x0F;
     (hash, slot)
+}
+
+/// Découpe un chemin hiérarchique (ex. `"/boot/drivers/nvme.sys"`) en segments non vides (max 8 niveaux).
+pub fn split_path(path: &str) -> Result<Vec<&str, 8>, &'static str> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Err("Chemin de fichier vide");
+    }
+
+    let mut parts: Vec<&str, 8> = Vec::new();
+    for segment in trimmed.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment.len() > 64 {
+            return Err("Segment de chemin trop long (max 64 octets)");
+        }
+        parts
+            .push(segment)
+            .map_err(|_| "Profondeur de chemin maximale depassee (max 8 niveaux)")?;
+    }
+
+    if parts.is_empty() {
+        return Err("Chemin de fichier invalide");
+    }
+    Ok(parts)
+}
+
+/// Encode la taille logique dans les 2 derniers octets du payload d'un `TrieNode` (`3574..3576`).
+fn set_trailer_logical_len(node: &mut TrieNode, len: usize) -> Result<(), &'static str> {
+    let len_u16 = u16::try_from(len).map_err(|_| "Taille logique de recette invalide")?;
+    let bytes = len_u16.to_le_bytes();
+    node.payload[TRIE_RECIPE_DATA_CAPACITY] = bytes[0];
+    node.payload[TRIE_RECIPE_DATA_CAPACITY + 1] = bytes[1];
+    Ok(())
+}
+
+/// Retourne la taille logique d'un `TrieNode` blob quel que soit son [`Opcode`] `kpack`.
+#[must_use]
+pub fn blob_logical_len(node: &TrieNode) -> usize {
+    match Opcode::from_u8(node.opcode) {
+        Some(Opcode::Lit | Opcode::Rle | Opcode::Delta) => node.param as usize,
+        Some(Opcode::Dict | Opcode::Xor | Opcode::Seed | Opcode::Rs) => {
+            let trailer = u16::from_le_bytes([
+                node.payload[TRIE_RECIPE_DATA_CAPACITY],
+                node.payload[TRIE_RECIPE_DATA_CAPACITY + 1],
+            ]) as usize;
+            if trailer > 0 {
+                trailer
+            } else {
+                node.param as usize
+            }
+        }
+        None => 0,
+    }
 }
 
 /// Crée un `TrieNode` de données exécutant une recette `kpack` (`Opcode::Lit` ou `Opcode::Rle` automatique).
@@ -165,6 +234,313 @@ pub fn make_delta_blob_node(
     Ok(node)
 }
 
+/// Crée un `TrieNode` codé par dictionnaire (`kpack::Opcode::Dict`) à partir d'un dictionnaire `dict_noun`
+/// découpé en mots de `word_size` octets.
+///
+/// Le `dict_noun` de référence est attaché à la branche `0` du `TrieNode`.
+pub fn make_dict_blob_node(
+    dict_noun: Noun,
+    dict_data: &[u8],
+    word_size: usize,
+    target_data: &[u8],
+) -> Result<TrieNode, &'static str> {
+    if word_size == 0 || dict_data.len() < word_size {
+        return Err("Dictionnaire kpack invalide ou word_size nul");
+    }
+    if !target_data.len().is_multiple_of(word_size) {
+        return Err("La taille des donnees doit etre un multiple de word_size pour Opcode::Dict");
+    }
+    let word_count = target_data.len() / word_size;
+    if word_count > TRIE_RECIPE_DATA_CAPACITY || target_data.len() > TRIE_PAYLOAD_CAPACITY {
+        return Err("Donnees trop volumineuses pour un seul TrieNode Dict");
+    }
+
+    let max_dict_words = (dict_data.len() / word_size).min(256);
+    let mut node = TrieNode::new();
+    node.opcode = Opcode::Dict as u8;
+    node.flags = FLAG_BLOB;
+    node.param = u32::try_from(word_size).map_err(|_| "word_size invalide")?;
+    node.set_branch(0, dict_noun);
+
+    for (idx, chunk) in target_data.chunks_exact(word_size).enumerate() {
+        let found = (0..max_dict_words)
+            .find(|&w| &dict_data[w * word_size..(w + 1) * word_size] == chunk)
+            .ok_or("Mot introuvable dans le dictionnaire de reference kpack")?;
+        node.payload[idx] = u8::try_from(found).map_err(|_| "Index de mot Dict > 255")?;
+    }
+
+    set_trailer_logical_len(&mut node, target_data.len())?;
+    Ok(node)
+}
+
+/// Crée un `TrieNode` codé par `kpack::Opcode::Xor` avec une clé constante `xor_key` (sans référence).
+pub fn make_xor_key_blob_node(xor_key: u8, data: &[u8]) -> Result<TrieNode, &'static str> {
+    if data.len() > TRIE_RECIPE_DATA_CAPACITY {
+        return Err("Blob trop grand pour Opcode::Xor (max 3574 octets)");
+    }
+
+    let mut node = TrieNode::new();
+    node.opcode = Opcode::Xor as u8;
+    node.flags = FLAG_BLOB;
+    node.param = u32::from(xor_key);
+    for (i, &b) in data.iter().enumerate() {
+        node.payload[i] = b ^ xor_key;
+    }
+    set_trailer_logical_len(&mut node, data.len())?;
+    Ok(node)
+}
+
+/// Crée un `TrieNode` codé par `kpack::Opcode::Xor` différentiel vis-à-vis d'un `base_noun` parent (attaché en branche `0`).
+pub fn make_xor_ref_blob_node(
+    base_noun: Noun,
+    base_data: &[u8],
+    new_data: &[u8],
+) -> Result<TrieNode, &'static str> {
+    if new_data.len() > TRIE_RECIPE_DATA_CAPACITY {
+        return Err("Blob trop grand pour Opcode::Xor (max 3574 octets)");
+    }
+    if base_data.len() < new_data.len() {
+        return Err("Le buffer de reference Xor doit etre au moins aussi grand que la cible");
+    }
+
+    let mut node = TrieNode::new();
+    node.opcode = Opcode::Xor as u8;
+    node.flags = FLAG_BLOB;
+    node.param = 0;
+    node.set_branch(0, base_noun);
+    for i in 0..new_data.len() {
+        node.payload[i] = new_data[i] ^ base_data[i];
+    }
+    set_trailer_logical_len(&mut node, new_data.len())?;
+    Ok(node)
+}
+
+/// Crée un `TrieNode` codé par formule générative `kpack::Opcode::Seed` (`xorshift32` + patchs épars).
+///
+/// Génère le flux `xorshift32(seed)` et n'enregistre dans le payload que les positions `(pos: u16, val: u8)`
+/// qui diffèrent du flux synthétique.
+pub fn make_seed_blob_node(seed: u32, target_data: &[u8]) -> Result<TrieNode, &'static str> {
+    if target_data.len() > TRIE_RECIPE_DATA_CAPACITY {
+        return Err("Blob trop grand pour Opcode::Seed (max 3574 octets)");
+    }
+
+    let mut state = if seed == 0 { 1 } else { seed };
+    let mut node = TrieNode::new();
+    node.opcode = Opcode::Seed as u8;
+    node.flags = FLAG_BLOB;
+    node.param = seed;
+
+    let mut patch_count: u16 = 0;
+    let mut offset = 2usize;
+
+    for (pos, &target_byte) in target_data.iter().enumerate() {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let synth_byte = (state & 0xFF) as u8;
+
+        if target_byte != synth_byte {
+            if offset + 3 > TRIE_RECIPE_DATA_CAPACITY {
+                return Err("Trop de patchs epars pour le payload Opcode::Seed");
+            }
+            let pos_le = u16::try_from(pos)
+                .map_err(|_| "Offset de patch Seed invalide")?
+                .to_le_bytes();
+            node.payload[offset] = pos_le[0];
+            node.payload[offset + 1] = pos_le[1];
+            node.payload[offset + 2] = target_byte;
+            offset += 3;
+            patch_count += 1;
+        }
+    }
+
+    let count_le = patch_count.to_le_bytes();
+    node.payload[0] = count_le[0];
+    node.payload[1] = count_le[1];
+    set_trailer_logical_len(&mut node, target_data.len())?;
+    Ok(node)
+}
+
+/// Crée un `TrieNode` codé par décalage bit-à-bit `kpack::Opcode::Rs` (`>> shift`).
+///
+/// Encode chaque octet `b` sous la forme `b << shift` afin que l'exécution de `Opcode::Rs` restitue `b`.
+pub fn make_rs_blob_node(shift: u8, target_data: &[u8]) -> Result<TrieNode, &'static str> {
+    let shift = shift & 0x07;
+    if target_data.len() > TRIE_RECIPE_DATA_CAPACITY {
+        return Err("Blob trop grand pour Opcode::Rs (max 3574 octets)");
+    }
+
+    let mut node = TrieNode::new();
+    node.opcode = Opcode::Rs as u8;
+    node.flags = FLAG_BLOB;
+    node.param = u32::from(shift);
+
+    for (i, &b) in target_data.iter().enumerate() {
+        if (b >> (8 - shift.max(1))) != 0 && shift > 0 {
+            return Err("Octet non representable sans perte par decalage Opcode::Rs");
+        }
+        node.payload[i] = b << shift;
+    }
+
+    set_trailer_logical_len(&mut node, target_data.len())?;
+    Ok(node)
+}
+
+/// Applique une mutation atomique Copy-on-Write sur une page de 4096 octets via [`cubefs::Nucleator::insert_byte`].
+#[must_use]
+pub fn nucleate_page_byte(
+    original: &[u8; 4096],
+    offset: usize,
+    new_byte: u8,
+) -> Option<([u8; 4096], u8)> {
+    Nucleator::insert_byte(original, offset, new_byte)
+}
+
+/// Crée un `TrieNode` d'`Inode` multi-chunks (`FLAG_INODE`) référençant jusqu'à 16 chunks `FLAG_BLOB`
+/// et sérialisant dans son payload la structure [`cubefs::Inode`] suivie des [`cubefs::Extent`]s.
+pub fn make_multi_chunk_inode_node(
+    chunk_nouns: &[Noun],
+    chunk_lengths: &[u32],
+    total_size: u64,
+) -> Result<TrieNode, &'static str> {
+    if chunk_nouns.is_empty() || chunk_nouns.len() > MAX_INODE_CHUNKS {
+        return Err("Nombre de chunks invalide pour un Inode (1..=16)");
+    }
+    if chunk_nouns.len() != chunk_lengths.len() {
+        return Err("Incoherence entre chunk_nouns et chunk_lengths");
+    }
+
+    let mut node = TrieNode::new();
+    node.opcode = Opcode::Lit as u8;
+    node.flags = FLAG_INODE;
+    node.param = u32::try_from(total_size).map_err(|_| "Taille totale d'Inode trop grande")?;
+
+    let mut extents: Vec<Extent, MAX_INODE_CHUNKS> = Vec::new();
+    let mut file_off = 0u64;
+
+    for (i, (chunk_noun, &chunk_len)) in chunk_nouns.iter().zip(chunk_lengths.iter()).enumerate() {
+        let slot = u8::try_from(i).unwrap_or(0);
+        node.set_branch(slot, chunk_noun.clone());
+
+        let ext = Extent {
+            file_off,
+            len: u64::from(chunk_len),
+            first_chunk_id: *chunk_noun.as_bytes(),
+            count: 1,
+            last_len: chunk_len,
+        };
+        extents.push(ext).map_err(|_| "Trop d'Extents")?;
+        file_off += u64::from(chunk_len);
+    }
+
+    let inode_id = *Noun::of(chunk_nouns[0].as_bytes()).as_bytes();
+    let inode = Inode {
+        id: inode_id,
+        size: total_size,
+    };
+
+    // Sérialisation dans `node.payload` :
+    // [0..4]   : INODE_MAGIC ("JINO")
+    // [4..36]  : inode.id ([u8; 32])
+    // [36..44] : inode.size (u64 LE)
+    // [44..46] : extent_count (u16 LE)
+    // Pour chaque Extent (56 octets) :
+    //   file_off (8) + len (8) + first_chunk_id (32) + count (4) + last_len (4)
+    let mut pos = 0usize;
+    node.payload[pos..pos + 4].copy_from_slice(&INODE_MAGIC);
+    pos += 4;
+    node.payload[pos..pos + 32].copy_from_slice(&inode.id);
+    pos += 32;
+    node.payload[pos..pos + 8].copy_from_slice(&inode.size.to_le_bytes());
+    pos += 8;
+    let ext_count = u16::try_from(extents.len()).unwrap_or(0);
+    node.payload[pos..pos + 2].copy_from_slice(&ext_count.to_le_bytes());
+    pos += 2;
+
+    for ext in &extents {
+        node.payload[pos..pos + 8].copy_from_slice(&ext.file_off.to_le_bytes());
+        pos += 8;
+        node.payload[pos..pos + 8].copy_from_slice(&ext.len.to_le_bytes());
+        pos += 8;
+        node.payload[pos..pos + 32].copy_from_slice(&ext.first_chunk_id);
+        pos += 32;
+        node.payload[pos..pos + 4].copy_from_slice(&ext.count.to_le_bytes());
+        pos += 4;
+        node.payload[pos..pos + 4].copy_from_slice(&ext.last_len.to_le_bytes());
+        pos += 4;
+    }
+
+    Ok(node)
+}
+
+/// Désérialise l'[`Inode`] et la table des [`Extent`]s `cubefs` depuis un `TrieNode` `FLAG_INODE`.
+pub fn read_inode_extents(
+    node: &TrieNode,
+) -> Result<(Inode, Vec<Extent, MAX_INODE_CHUNKS>), &'static str> {
+    if node.flags != FLAG_INODE {
+        return Err("Le TrieNode n'est pas un Inode multi-chunks (FLAG_INODE)");
+    }
+    if node.payload[0..4] != INODE_MAGIC {
+        return Err("Magic JINO invalide dans le TrieNode Inode");
+    }
+
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&node.payload[4..36]);
+    let size = u64::from_le_bytes(
+        node.payload[36..44]
+            .try_into()
+            .map_err(|_| "Lecture inode.size")?,
+    );
+    let ext_count = u16::from_le_bytes([node.payload[44], node.payload[45]]) as usize;
+    if ext_count == 0 || ext_count > MAX_INODE_CHUNKS {
+        return Err("Nombre d'Extents invalide dans le TrieNode Inode");
+    }
+
+    let mut pos = 46usize;
+    let mut extents: Vec<Extent, MAX_INODE_CHUNKS> = Vec::new();
+    for _ in 0..ext_count {
+        let file_off = u64::from_le_bytes(
+            node.payload[pos..pos + 8]
+                .try_into()
+                .map_err(|_| "Lecture extent.file_off")?,
+        );
+        pos += 8;
+        let len = u64::from_le_bytes(
+            node.payload[pos..pos + 8]
+                .try_into()
+                .map_err(|_| "Lecture extent.len")?,
+        );
+        pos += 8;
+        let mut first_chunk_id = [0u8; 32];
+        first_chunk_id.copy_from_slice(&node.payload[pos..pos + 32]);
+        pos += 32;
+        let count = u32::from_le_bytes(
+            node.payload[pos..pos + 4]
+                .try_into()
+                .map_err(|_| "Lecture extent.count")?,
+        );
+        pos += 4;
+        let last_len = u32::from_le_bytes(
+            node.payload[pos..pos + 4]
+                .try_into()
+                .map_err(|_| "Lecture extent.last_len")?,
+        );
+        pos += 4;
+
+        extents
+            .push(Extent {
+                file_off,
+                len,
+                first_chunk_id,
+                count,
+                last_len,
+            })
+            .map_err(|_| "Trop d'Extents")?;
+    }
+
+    Ok((Inode { id, size }, extents))
+}
+
 /// Crée un `TrieNode` répertoire (`FLAG_DIR`) vide.
 #[must_use]
 pub fn make_empty_dir_node() -> TrieNode {
@@ -184,6 +560,7 @@ pub fn read_dir_entries(dir_node: &TrieNode) -> Result<Vec<DirRecord, 16>, &'sta
     let entry_count = u16::try_from(dir_node.param).unwrap_or(0);
     let iter = BTreeIterator::new(&dir_node.payload, entry_count);
     let mut records: Vec<DirRecord, 16> = Vec::new();
+    let mut claimed_slots: u16 = 0;
 
     for entry in iter {
         let name_str =
@@ -192,8 +569,9 @@ pub fn read_dir_entries(dir_node: &TrieNode) -> Result<Vec<DirRecord, 16>, &'sta
         let _ = core::fmt::Write::write_str(&mut stack_name, name_str);
 
         let target = Noun::from_bytes(&entry.val_data).ok_or("Noun d'entree CubeFS invalide")?;
-        let slot = find_branch_for_noun(dir_node, &target)
+        let slot = find_unclaimed_branch_for_noun(dir_node, &target, claimed_slots)
             .unwrap_or_else(|| name_hash_and_slot(name_str).1);
+        claimed_slots |= 1 << slot;
 
         records
             .push(DirRecord {
@@ -209,8 +587,16 @@ pub fn read_dir_entries(dir_node: &TrieNode) -> Result<Vec<DirRecord, 16>, &'sta
     Ok(records)
 }
 
-fn find_branch_for_noun(dir_node: &TrieNode, target: &Noun) -> Option<u8> {
-    (0..16u8).find(|&i| dir_node.has_branch(i) && dir_node.get_branch(i) == Some(target))
+fn find_unclaimed_branch_for_noun(
+    dir_node: &TrieNode,
+    target: &Noun,
+    claimed_slots: u16,
+) -> Option<u8> {
+    (0..16u8).find(|&i| {
+        (claimed_slots & (1 << i)) == 0
+            && dir_node.has_branch(i)
+            && dir_node.get_branch(i) == Some(target)
+    })
 }
 
 /// Encode une liste d'entrées [`DirRecord`] dans un `TrieNode` répertoire (`FLAG_DIR`)
@@ -285,7 +671,7 @@ pub fn upsert_dir_entry(
     } else {
         (0..16u8)
             .find(|&s| (used_mask & (1 << s)) == 0)
-            .ok_or("Les 16 branches du repertoire racine sont occupees")?
+            .ok_or("Les 16 branches du repertoire sont occupees")?
     };
 
     let mut stack_name = String::<64>::new();
@@ -338,7 +724,7 @@ pub fn to_cubefs_btree_node(dir_node: &TrieNode) -> BTreeNode {
 /// Construit le couple `(`[`Inode`]`, `[`Extent`]`)` de `cubefs` pour un blob `TrieNode`.
 #[must_use]
 pub fn blob_inode_and_extent(blob_noun: &Noun, blob_node: &TrieNode) -> (Inode, Extent) {
-    let len = u64::from(blob_node.param);
+    let len = u64::try_from(blob_logical_len(blob_node)).unwrap_or(0);
     let inode = Inode {
         id: *blob_noun.as_bytes(),
         size: len,
@@ -348,7 +734,7 @@ pub fn blob_inode_and_extent(blob_noun: &Noun, blob_node: &TrieNode) -> (Inode, 
         len: len.max(1),
         first_chunk_id: *blob_noun.as_bytes(),
         count: 1,
-        last_len: blob_node.param,
+        last_len: u32::try_from(len).unwrap_or(0),
     };
     (inode, extent)
 }

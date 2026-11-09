@@ -1,9 +1,12 @@
 use crate::commit::{Checkpoint, JiCommit};
 use crate::superblock::{AWQ_BRANCH_COUNT, FIRST_DATA_LBA, JiSuperblock};
 use crate::tree::{
-    DirRecord, FLAG_BLOB, FLAG_DIR, TRIE_PAYLOAD_CAPACITY, VAL_TYPE_INODE, compute_node_noun,
-    lookup_dir_entry, make_blob_node, make_delta_blob_node, make_empty_dir_node, read_dir_entries,
-    upsert_dir_entry, write_dir_entries,
+    DirRecord, FLAG_BLOB, FLAG_DIR, FLAG_INODE, MAX_INODE_CHUNKS, MAX_MULTI_CHUNK_FILE_SIZE,
+    TRIE_PAYLOAD_CAPACITY, VAL_TYPE_DIRECTORY, VAL_TYPE_INODE, blob_logical_len, compute_node_noun,
+    lookup_dir_entry, make_blob_node, make_delta_blob_node, make_dict_blob_node,
+    make_empty_dir_node, make_multi_chunk_inode_node, make_rs_blob_node, make_seed_blob_node,
+    make_xor_key_blob_node, make_xor_ref_blob_node, nucleate_page_byte, read_dir_entries,
+    read_inode_extents, split_path, upsert_dir_entry, write_dir_entries,
 };
 use alloc::collections::BTreeMap;
 use alloc::vec;
@@ -245,30 +248,145 @@ impl<'a, D: BlockDevice> JiEngine<'a, D> {
         Ok(dest)
     }
 
-    /// Écrit un fichier dans le `virtual_ocean` (Copy-on-Write en RAM) avec compression `kpack` (`Lit` ou `Rle`).
-    pub fn stage_file(&mut self, name: &str, data: &[u8]) -> Result<Noun, &'static str> {
-        let blob_node = make_blob_node(data)?;
-        let blob_noun = self.with_router(|router| router.write_virtual_node(blob_node));
+    /// Résout un chemin (plat ou hiérarchique avec `/`) depuis une racine d'arbre `root_tree`
+    /// et retourne `(val_type, target_noun)`.
+    pub fn resolve_entry_in_tree(
+        &self,
+        root_tree: &Noun,
+        path: &str,
+    ) -> Result<(u8, Noun), &'static str> {
+        let parts = split_path(path)?;
+        let mut current_dir_noun = root_tree.clone();
 
+        for (i, &segment) in parts.iter().enumerate() {
+            let dir_node = self.fetch_node_ref(&current_dir_noun)?;
+            if dir_node.flags != FLAG_DIR {
+                return Err("Le noeud intermediaire n'est pas un repertoire CubeFS (FLAG_DIR)");
+            }
+            let entry =
+                lookup_dir_entry(&dir_node, segment).ok_or("Fichier introuvable dans l'arbre")?;
+            let target_noun =
+                Noun::from_bytes(&entry.val_data).ok_or("Noun d'entree CubeFS invalide")?;
+
+            if i + 1 == parts.len() {
+                return Ok((entry.val_type, target_noun));
+            }
+            if entry.val_type != VAL_TYPE_DIRECTORY {
+                return Err("Un segment parent du chemin n'est pas un repertoire");
+            }
+            current_dir_noun = target_noun;
+        }
+
+        Err("Chemin introuvable")
+    }
+
+    /// Insère ou met à jour récursivement une entrée à l'adresse `segments` dans le sous-arbre `dir_noun`,
+    /// en créant automatiquement les sous-répertoires intermédiaires (`FLAG_DIR`) en Copy-on-Write.
+    fn upsert_path_segments(
+        &mut self,
+        dir_noun: &Noun,
+        segments: &[&str],
+        val_type: u8,
+        target: Noun,
+    ) -> Result<Noun, &'static str> {
+        let current_dir = self.fetch_node(dir_noun)?;
+        if current_dir.flags != FLAG_DIR {
+            return Err("Noeud repertoire invalide (FLAG_DIR attendu)");
+        }
+
+        if segments.len() == 1 {
+            let updated_dir = upsert_dir_entry(&current_dir, segments[0], val_type, target)?;
+            return Ok(self.with_router(|router| router.write_virtual_node(updated_dir)));
+        }
+
+        let head = segments[0];
+        let child_dir_noun = if let Some(entry) = lookup_dir_entry(&current_dir, head) {
+            if entry.val_type != VAL_TYPE_DIRECTORY {
+                return Err("Conflit de chemin : une entree fichier porte deja le nom du dossier");
+            }
+            Noun::from_bytes(&entry.val_data).ok_or("Noun de sous-repertoire invalide")?
+        } else {
+            let empty_sub = make_empty_dir_node();
+            self.with_router(|router| router.write_virtual_node(empty_sub))
+        };
+
+        let new_child_noun =
+            self.upsert_path_segments(&child_dir_noun, &segments[1..], val_type, target)?;
+        let updated_dir =
+            upsert_dir_entry(&current_dir, head, VAL_TYPE_DIRECTORY, new_child_noun)?;
+        Ok(self.with_router(|router| router.write_virtual_node(updated_dir)))
+    }
+
+    /// Met à jour un chemin `path` dans `working_root` et synchronise `active_plan.directory`.
+    fn set_working_path_entry(
+        &mut self,
+        path: &str,
+        val_type: u8,
+        target: Noun,
+    ) -> Result<Noun, &'static str> {
+        let parts = split_path(path)?;
         let working_root = self.working_root.clone();
-        let current_dir = self.fetch_node(&working_root)?;
-        let updated_dir = upsert_dir_entry(&current_dir, name, VAL_TYPE_INODE, blob_noun.clone())?;
-        let new_root = self.with_router(|router| router.write_virtual_node(updated_dir));
-
+        let new_root = self.upsert_path_segments(&working_root, &parts, val_type, target.clone())?;
         self.working_root = new_root;
         self.active_plan.directory = self.working_root.clone();
-        Ok(blob_noun)
+        Ok(target)
+    }
+
+    /// Crée un sous-répertoire CubeFS (`ji mkdir <path>`) et tous ses répertoires parents en Copy-on-Write.
+    pub fn mkdir(&mut self, path: &str) -> Result<Noun, &'static str> {
+        let empty_dir = make_empty_dir_node();
+        let dir_noun = self.with_router(|router| router.write_virtual_node(empty_dir));
+        self.set_working_path_entry(path, VAL_TYPE_DIRECTORY, dir_noun)
+    }
+
+    /// Écrit un fichier dans le `virtual_ocean` (Copy-on-Write en RAM) :
+    /// - Si `data.len() <= 3576` (`TRIE_PAYLOAD_CAPACITY`) : stocké dans un seul `TrieNode` `FLAG_BLOB` (`Lit` ou `Rle`).
+    /// - Si `data.len() > 3576` (jusqu'à `57 216` octets) : découpé automatiquement en chunks `FLAG_BLOB` et
+    ///   indexé par un `TrieNode` `FLAG_INODE` contenant un [`cubefs::Inode`] et ses [`cubefs::Extent`]s.
+    /// - Supporte les chemins hiérarchiques avec sous-répertoires (ex. `"/boot/kernel.sys"`).
+    pub fn stage_file(&mut self, path: &str, data: &[u8]) -> Result<Noun, &'static str> {
+        if data.len() > MAX_MULTI_CHUNK_FILE_SIZE {
+            return Err("Fichier depasse la capacite maximale d'un Inode multi-chunks (57216 octets)");
+        }
+
+        let target_noun = if data.len() <= TRIE_PAYLOAD_CAPACITY {
+            let blob_node = make_blob_node(data)?;
+            self.with_router(|router| router.write_virtual_node(blob_node))
+        } else {
+            let mut chunk_nouns: Vec<Noun, MAX_INODE_CHUNKS> = Vec::new();
+            let mut chunk_lengths: Vec<u32, MAX_INODE_CHUNKS> = Vec::new();
+
+            for slice in data.chunks(TRIE_PAYLOAD_CAPACITY) {
+                let chunk_node = make_blob_node(slice)?;
+                let chunk_noun = self.with_router(|router| router.write_virtual_node(chunk_node));
+                chunk_nouns
+                    .push(chunk_noun)
+                    .map_err(|_| "Trop de chunks pour un Inode")?;
+                chunk_lengths
+                    .push(u32::try_from(slice.len()).unwrap_or(0))
+                    .map_err(|_| "Trop de chunks pour un Inode")?;
+            }
+
+            let inode_node = make_multi_chunk_inode_node(
+                chunk_nouns.as_slice(),
+                chunk_lengths.as_slice(),
+                data.len() as u64,
+            )?;
+            self.with_router(|router| router.write_virtual_node(inode_node))
+        };
+
+        self.set_working_path_entry(path, VAL_TYPE_INODE, target_noun)
     }
 
     /// Écrit une nouvelle version d'un fichier dans le `virtual_ocean` en l'encodant sous forme de
     /// recette delta [`kpack::Opcode::Delta`] par rapport à sa version précédente dans l'arbre courant.
-    pub fn stage_file_delta(&mut self, name: &str, new_data: &[u8]) -> Result<Noun, &'static str> {
-        let working_root = self.working_root.clone();
-        let current_dir = self.fetch_node(&working_root)?;
-        let entry = lookup_dir_entry(&current_dir, name)
-            .ok_or("Fichier parent introuvable pour l'encodage Delta")?;
-        let base_noun =
-            Noun::from_bytes(&entry.val_data).ok_or("Noun de base invalide dans le repertoire")?;
+    pub fn stage_file_delta(&mut self, path: &str, new_data: &[u8]) -> Result<Noun, &'static str> {
+        let (val_type, base_noun) = self
+            .resolve_entry_in_tree(&self.working_root, path)
+            .map_err(|_| "Fichier parent introuvable pour l'encodage Delta")?;
+        if val_type != VAL_TYPE_INODE {
+            return Err("La cible pour l'encodage Delta n'est pas un fichier");
+        }
 
         let mut base_buf = [0u8; TRIE_PAYLOAD_CAPACITY];
         let base_len = self.read_blob(&base_noun, &mut base_buf)?;
@@ -276,30 +394,144 @@ impl<'a, D: BlockDevice> JiEngine<'a, D> {
         let delta_node = make_delta_blob_node(base_noun, &base_buf[..base_len], new_data)?;
         let delta_noun = self.with_router(|router| router.write_virtual_node(delta_node));
 
-        let updated_dir =
-            upsert_dir_entry(&current_dir, name, VAL_TYPE_INODE, delta_noun.clone())?;
-        let new_root = self.with_router(|router| router.write_virtual_node(updated_dir));
-
-        self.working_root = new_root;
-        self.active_plan.directory = self.working_root.clone();
-        Ok(delta_noun)
+        self.set_working_path_entry(path, VAL_TYPE_INODE, delta_noun)
     }
 
-    /// Reconstruit le contenu d'un blob `TrieNode` en exécutant sa recette `kpack`
-    /// (avec résolution récursive de la branche `0` si `opcode == Opcode::Delta`).
-    pub fn read_blob(&self, blob_noun: &Noun, output: &mut [u8]) -> Result<usize, &'static str> {
-        let node = self.fetch_node_ref(blob_noun)?;
-        if node.flags != FLAG_BLOB {
-            return Err("Le Noun demande n'est pas un blob de donnees (FLAG_BLOB)");
+    /// Écrit un fichier dans le `virtual_ocean` en le compressant par dictionnaire [`kpack::Opcode::Dict`]
+    /// vis-à-vis d'un fichier dictionnaire `dict_path` déjà présent dans l'arbre de travail.
+    pub fn stage_file_dict(
+        &mut self,
+        path: &str,
+        dict_path: &str,
+        word_size: usize,
+        data: &[u8],
+    ) -> Result<Noun, &'static str> {
+        let (_, dict_noun) = self
+            .resolve_entry_in_tree(&self.working_root, dict_path)
+            .map_err(|_| "Fichier dictionnaire de reference introuvable dans l'arbre")?;
+        let mut dict_buf = [0u8; TRIE_PAYLOAD_CAPACITY];
+        let dict_len = self.read_blob(&dict_noun, &mut dict_buf)?;
+
+        let dict_node = make_dict_blob_node(dict_noun, &dict_buf[..dict_len], word_size, data)?;
+        let node_noun = self.with_router(|router| router.write_virtual_node(dict_node));
+        self.set_working_path_entry(path, VAL_TYPE_INODE, node_noun)
+    }
+
+    /// Écrit un fichier encodé par [`kpack::Opcode::Xor`] avec une clé constante `xor_key`.
+    pub fn stage_file_xor_key(
+        &mut self,
+        path: &str,
+        xor_key: u8,
+        data: &[u8],
+    ) -> Result<Noun, &'static str> {
+        let xor_node = make_xor_key_blob_node(xor_key, data)?;
+        let xor_noun = self.with_router(|router| router.write_virtual_node(xor_node));
+        self.set_working_path_entry(path, VAL_TYPE_INODE, xor_noun)
+    }
+
+    /// Écrit une nouvelle version d'un fichier encodée par [`kpack::Opcode::Xor`] différentiel
+    /// vis-à-vis de la version précédente du fichier (référencée en branche `0`).
+    pub fn stage_file_xor_delta(
+        &mut self,
+        path: &str,
+        new_data: &[u8],
+    ) -> Result<Noun, &'static str> {
+        let (_, base_noun) = self
+            .resolve_entry_in_tree(&self.working_root, path)
+            .map_err(|_| "Fichier parent introuvable pour l'encodage Xor differentiel")?;
+        let mut base_buf = [0u8; TRIE_PAYLOAD_CAPACITY];
+        let base_len = self.read_blob(&base_noun, &mut base_buf)?;
+
+        let xor_node = make_xor_ref_blob_node(base_noun, &base_buf[..base_len], new_data)?;
+        let xor_noun = self.with_router(|router| router.write_virtual_node(xor_node));
+        self.set_working_path_entry(path, VAL_TYPE_INODE, xor_noun)
+    }
+
+    /// Écrit un fichier encodé par formule générative [`kpack::Opcode::Seed`] (`xorshift32` + patchs épars).
+    pub fn stage_file_seed(
+        &mut self,
+        path: &str,
+        seed: u32,
+        data: &[u8],
+    ) -> Result<Noun, &'static str> {
+        let seed_node = make_seed_blob_node(seed, data)?;
+        let seed_noun = self.with_router(|router| router.write_virtual_node(seed_node));
+        self.set_working_path_entry(path, VAL_TYPE_INODE, seed_noun)
+    }
+
+    /// Écrit un fichier encodé par décalage bit-à-bit [`kpack::Opcode::Rs`].
+    pub fn stage_file_rs(
+        &mut self,
+        path: &str,
+        shift: u8,
+        data: &[u8],
+    ) -> Result<Noun, &'static str> {
+        let rs_node = make_rs_blob_node(shift, data)?;
+        let rs_noun = self.with_router(|router| router.write_virtual_node(rs_node));
+        self.set_working_path_entry(path, VAL_TYPE_INODE, rs_noun)
+    }
+
+    /// Applique une mutation atomique Copy-on-Write d'un octet via [`cubefs::Nucleator::insert_byte`]
+    /// sur le fichier `path` et retourne `(nouveau_noun, octet_ejecte)`.
+    pub fn nucleate_working_file_byte(
+        &mut self,
+        path: &str,
+        offset: usize,
+        new_byte: u8,
+    ) -> Result<(Noun, u8), &'static str> {
+        let (_, current_noun) = self.resolve_entry_in_tree(&self.working_root, path)?;
+        let mut page = [0u8; 4096];
+        let current_len = self.read_blob(&current_noun, &mut page)?;
+        if offset > current_len || offset >= 4096 {
+            return Err("Offset hors bornes pour Nucleator::insert_byte");
         }
 
-        let target_len = (node.param as usize).min(output.len());
+        let (mutated_page, ejected_byte) = nucleate_page_byte(&page, offset, new_byte)
+            .ok_or("Echec de Nucleator::insert_byte")?;
+        let new_len = (current_len + 1).min(4096);
+        let new_noun = self.stage_file(path, &mutated_page[..new_len])?;
+        Ok((new_noun, ejected_byte))
+    }
+
+    /// Reconstruit le contenu d'un nœud de fichier (`FLAG_BLOB` ou `FLAG_INODE` multi-chunks)
+    /// en exécutant ses recettes `kpack` (`Lit`, `Rle`, `Delta`, `Dict`, `Xor`, `Seed`, `Rs`).
+    pub fn read_blob(&self, blob_noun: &Noun, output: &mut [u8]) -> Result<usize, &'static str> {
+        let node = self.fetch_node_ref(blob_noun)?;
+
+        if node.flags == FLAG_INODE {
+            let (_inode, extents) = read_inode_extents(&node)?;
+            let mut cursor = 0usize;
+            for ext in &extents {
+                if cursor >= output.len() {
+                    break;
+                }
+                let chunk_noun =
+                    Noun::from_bytes(&ext.first_chunk_id).ok_or("Noun de chunk Extent invalide")?;
+                let remaining = output.len() - cursor;
+                let max_chunk = (ext.last_len as usize).min(remaining);
+                let read_n =
+                    self.read_blob(&chunk_noun, &mut output[cursor..cursor + max_chunk])?;
+                cursor += read_n;
+            }
+            return Ok(cursor);
+        }
+
+        if node.flags != FLAG_BLOB {
+            return Err("Le Noun demande n'est ni un FLAG_BLOB ni un FLAG_INODE");
+        }
+
+        let target_len = blob_logical_len(&node).min(output.len());
         output[..target_len].fill(0);
 
-        if node.opcode == Opcode::Delta as u8 {
+        let needs_ref = matches!(
+            Opcode::from_u8(node.opcode),
+            Some(Opcode::Delta | Opcode::Dict)
+        ) || (node.opcode == Opcode::Xor as u8 && node.has_branch(0));
+
+        if needs_ref {
             let base_noun = node
                 .get_branch(0)
-                .ok_or("Blob Delta corrompu : branche 0 (reference parente) absente")?;
+                .ok_or("Blob kpack corrompu : branche 0 (reference parente) absente")?;
             let mut ref_buf = [0u8; TRIE_PAYLOAD_CAPACITY];
             let ref_len = self.read_blob(base_noun, &mut ref_buf)?;
             node.execute_recipe(&mut output[..target_len], Some(&ref_buf[..ref_len]));
@@ -310,22 +542,23 @@ impl<'a, D: BlockDevice> JiEngine<'a, D> {
         Ok(target_len)
     }
 
-    /// Lit un fichier nommé depuis n'importe quelle racine d'arbre `root_tree` (commit passé ou `working_root`).
+    /// Lit un fichier (chemin plat ou avec sous-répertoires `/`) depuis n'importe quelle racine d'arbre `root_tree`.
     pub fn read_file(
         &self,
         root_tree: &Noun,
-        name: &str,
+        path: &str,
         output: &mut [u8],
     ) -> Result<usize, &'static str> {
-        let dir_node = self.fetch_node_ref(root_tree)?;
-        let entry = lookup_dir_entry(&dir_node, name).ok_or("Fichier introuvable dans l'arbre")?;
-        let blob_noun = Noun::from_bytes(&entry.val_data).ok_or("Noun de fichier invalide")?;
+        let (val_type, blob_noun) = self.resolve_entry_in_tree(root_tree, path)?;
+        if val_type != VAL_TYPE_INODE {
+            return Err("Le chemin demande designe un repertoire et non un fichier");
+        }
         self.read_blob(&blob_noun, output)
     }
 
     /// Lit un fichier dans l'espace de travail courant (`working_root`).
-    pub fn read_working_file(&self, name: &str, output: &mut [u8]) -> Result<usize, &'static str> {
-        self.read_file(&self.working_root, name, output)
+    pub fn read_working_file(&self, path: &str, output: &mut [u8]) -> Result<usize, &'static str> {
+        self.read_file(&self.working_root, path, output)
     }
 
     /// Ajoute une couche système [`Layer`] (`plans`) au [`Plan`] actif avant le prochain commit.
@@ -605,39 +838,9 @@ impl<'a, D: BlockDevice> JiEngine<'a, D> {
             )
         })?;
 
-        // 2. Synchronisation du catalogue `cubefs` des deux arbres (priorité à `source_branch` en cas de collision)
-        let target_dir = self.fetch_node(&target_commit.root_tree)?;
-        let source_dir = self.fetch_node(&source_commit.root_tree)?;
-        let mut merged_records = read_dir_entries(&target_dir)?;
-        let source_records = read_dir_entries(&source_dir)?;
-
-        for srec in source_records {
-            if let Some(existing) = merged_records
-                .iter_mut()
-                .find(|r| r.name.as_str() == srec.name.as_str())
-            {
-                existing.target = srec.target;
-                existing.val_type = srec.val_type;
-            } else {
-                let mut used_mask: u16 = 0;
-                for r in &merged_records {
-                    used_mask |= 1 << r.slot;
-                }
-                let slot = if (used_mask & (1 << srec.slot)) == 0 {
-                    srec.slot
-                } else {
-                    (0..16u8)
-                        .find(|&s| (used_mask & (1 << s)) == 0)
-                        .ok_or("Repertoire sature lors du merge")?
-                };
-                merged_records
-                    .push(DirRecord { slot, ..srec })
-                    .map_err(|_| "Repertoire sature lors du merge")?;
-            }
-        }
-
-        let synced_dir = write_dir_entries(&merged_records)?;
-        let merged_tree_noun = self.with_router(|router| router.write_virtual_node(synced_dir));
+        // 2. Synchronisation récursive du catalogue `cubefs` des deux arbres (sous-répertoires compris)
+        let merged_tree_noun =
+            self.merge_dir_nodes_recursive(&target_commit.root_tree, &source_commit.root_tree)?;
 
         // 3. Fusion commutative des Plans (`plans::Plan::merge_with`)
         let mut plan_target = Plan::new(
@@ -670,6 +873,56 @@ impl<'a, D: BlockDevice> JiEngine<'a, D> {
         self.commit_internal(message, timestamp, budget, source_commit_noun)
     }
 
+    /// Fusionne récursivement deux répertoires `FLAG_DIR` (`target_dir_noun` et `source_dir_noun`),
+    /// en fusionnant en profondeur les sous-répertoires (`VAL_TYPE_DIRECTORY`) portant le même nom.
+    fn merge_dir_nodes_recursive(
+        &mut self,
+        target_dir_noun: &Noun,
+        source_dir_noun: &Noun,
+    ) -> Result<Noun, &'static str> {
+        let target_dir = self.fetch_node(target_dir_noun)?;
+        let source_dir = self.fetch_node(source_dir_noun)?;
+        let mut merged_records = read_dir_entries(&target_dir)?;
+        let source_records = read_dir_entries(&source_dir)?;
+
+        for srec in source_records {
+            if let Some(pos) = merged_records
+                .iter()
+                .position(|r| r.name.as_str() == srec.name.as_str())
+            {
+                if merged_records[pos].val_type == VAL_TYPE_DIRECTORY
+                    && srec.val_type == VAL_TYPE_DIRECTORY
+                {
+                    let existing_target = merged_records[pos].target.clone();
+                    let sub_merged =
+                        self.merge_dir_nodes_recursive(&existing_target, &srec.target)?;
+                    merged_records[pos].target = sub_merged;
+                } else {
+                    merged_records[pos].target = srec.target;
+                    merged_records[pos].val_type = srec.val_type;
+                }
+            } else {
+                let mut used_mask: u16 = 0;
+                for r in &merged_records {
+                    used_mask |= 1 << r.slot;
+                }
+                let slot = if (used_mask & (1 << srec.slot)) == 0 {
+                    srec.slot
+                } else {
+                    (0..16u8)
+                        .find(|&s| (used_mask & (1 << s)) == 0)
+                        .ok_or("Repertoire sature lors du merge")?
+                };
+                merged_records
+                    .push(DirRecord { slot, ..srec })
+                    .map_err(|_| "Repertoire sature lors du merge")?;
+            }
+        }
+
+        let synced_dir = write_dir_entries(&merged_records)?;
+        Ok(self.with_router(|router| router.write_virtual_node(synced_dir)))
+    }
+
     /// Parcourt la chaîne des parents depuis la tête de la branche `branch` et retourne l'historique des commits.
     pub fn history(&self, branch: u8) -> Result<Vec<(Noun, JiCommit), 16>, &'static str> {
         if branch as usize >= AWQ_BRANCH_COUNT {
@@ -687,13 +940,37 @@ impl<'a, D: BlockDevice> JiEngine<'a, D> {
         Ok(out)
     }
 
-    /// Liste les entrées fichiers (`DirRecord`) de l'arbre de travail courant (`working_root`).
-    pub fn list_working_files(&self) -> Result<Vec<DirRecord, 16>, &'static str> {
-        let dir_node = self.fetch_node_ref(&self.working_root)?;
+    /// Liste les entrées (`DirRecord`) d'un répertoire donné (`""` ou `"/"` pour la racine, ou ex. `"/boot/drivers"`).
+    pub fn list_dir_at(
+        &self,
+        root_tree: &Noun,
+        path: &str,
+    ) -> Result<Vec<DirRecord, 16>, &'static str> {
+        let trimmed = path.trim_matches('/');
+        let dir_noun = if trimmed.is_empty() {
+            root_tree.clone()
+        } else {
+            let (val_type, target) = self.resolve_entry_in_tree(root_tree, trimmed)?;
+            if val_type != VAL_TYPE_DIRECTORY {
+                return Err("Le chemin specifie n'est pas un repertoire");
+            }
+            target
+        };
+        let dir_node = self.fetch_node_ref(&dir_noun)?;
         if dir_node.flags != FLAG_DIR {
-            return Err("Racine courante invalide (FLAG_DIR attendu)");
+            return Err("Noeud repertoire invalide (FLAG_DIR attendu)");
         }
         read_dir_entries(&dir_node)
+    }
+
+    /// Liste les entrées d'un répertoire dans l'arbre de travail courant (`working_root`).
+    pub fn list_working_dir(&self, path: &str) -> Result<Vec<DirRecord, 16>, &'static str> {
+        self.list_dir_at(&self.working_root, path)
+    }
+
+    /// Liste les entrées fichiers (`DirRecord`) de la racine de l'arbre de travail courant (`working_root`).
+    pub fn list_working_files(&self) -> Result<Vec<DirRecord, 16>, &'static str> {
+        self.list_dir_at(&self.working_root, "/")
     }
 
     /// Recherche un commit dans l'historique de toutes les branches à partir d'un préfixe hexadécimal (ex. `"a1b2c3d4"`).
