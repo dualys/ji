@@ -1,0 +1,15 @@
+[package]
+name = "ji"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cubefs = "0.1.1"
+heapless = "0.9.3"
+jinshu = "0.1.0"
+kpack = "0.1.0"
+noun = "0.1.0"
+plans = "0.1.0"
+prisme = "0.1.0"
+wuu = "0.2.0"
+
